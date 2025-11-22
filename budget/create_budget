@@ -1,0 +1,50 @@
+<?php
+// Create a new budget (daily / weekly / monthly)
+require_once "../config/db.php";
+require_once "../auth/check_session.php";
+
+// Fallback helpers if your project doesn't include them:
+if (!function_exists('getJsonInput')) {
+    function getJsonInput(){ return json_decode(file_get_contents('php://input'), true); }
+}
+if (!function_exists('jsonResponse')) {
+    function jsonResponse($status, $message, $data=null){
+        header('Content-Type: application/json');
+        echo json_encode(["status"=>$status,"message"=>$message,"data"=>$data]);
+        exit;
+    }
+}
+
+$input = getJsonInput();
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) jsonResponse("error","Unauthenticated");
+
+$cycle = $input['cycle'] ?? null; // daily | weekly | monthly
+$amount = isset($input['amount']) ? (float)$input['amount'] : null;
+$notes = $input['notes'] ?? null;
+$start_date = $input['start_date'] ?? date('Y-m-d');
+
+if (!$cycle || !$amount) jsonResponse("error","Missing required fields: cycle and amount");
+
+$sql = "INSERT INTO budgets (user_id, category_id, amount_allocated, budget_month, budget_year, notes, created_at)
+        VALUES (?, 0, ?, ?, ?, ?, NOW())";
+
+// For cycle storage: we'll store month/year when monthly, otherwise 0
+$budget_month = 0;
+$budget_year = 0;
+if ($cycle === 'monthly') {
+    $d = new DateTime($start_date);
+    $budget_month = (int)$d->format('n');
+    $budget_year = (int)$d->format('Y');
+}
+
+$stmt = $conn->prepare($sql);
+if (!$stmt) jsonResponse("error","DB prepare failed: ".$conn->error);
+
+$stmt->bind_param("idiss", $user_id, $amount, $budget_month, $budget_year, $notes);
+if ($stmt->execute()){
+    $budget_id = $stmt->insert_id;
+    jsonResponse("success","Budget created",["budget_id"=>$budget_id]);
+} else {
+    jsonResponse("error","Insert failed: ".$stmt->error);
+}
