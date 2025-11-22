@@ -1,0 +1,69 @@
+<?php
+// Rule-based / simulated ML categorizer
+require_once "../config/db.php";
+require_once "../auth/check_session.php";
+
+if (!function_exists('jsonResponse')) {
+    function jsonResponse($status, $message, $data=null){
+        header('Content-Type: application/json');
+        echo json_encode(["status"=>$status,"message"=>$message,"data"=>$data]);
+        exit;
+    }
+}
+
+// Input: { "description": "Milk Tea ₱120", "amount": 120 }
+$input = json_decode(file_get_contents('php://input'), true);
+$description = strtolower($input['description'] ?? '');
+$amount = isset($input['amount']) ? (float)$input['amount'] : 0.0;
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) jsonResponse("error","Unauthenticated");
+
+// Load categories metadata (id, name, necessity, target_audience)
+$cat_q = $conn->query("SELECT category_id, category_name FROM categories");
+$categories = [];
+while($r = $cat_q->fetch_assoc()) $categories[] = $r;
+
+// Basic keyword map (expand as needed)
+$rules = [
+    "food" => ["milk tea","jollibee","mcdonald","burger","restaurant","kfc","grocer","grocery","sari-sari","panaderya","coffee","coffee shop","starbucks","lunch","dinner","breakfast"],
+    "transportation" => ["gasoline","diesel","petrol","uber","grab","taxi","bus","jeep","parking","gas","transpo","fuel"],
+    "entertainment" => ["netflix","spotify","hulu","cinema","movie","concert","games","playstation","xbox","spotify"],
+    "bills" => ["electric","water","meralco","bill","internet","wifi","globe","smart","tel"],
+    "shopping" => ["lazada","shopee","mall","clothes","shirt","pants","shoes","sneaker"],
+    "health" => ["clinic","hospital","doctor","medicine","pharmacy"],
+    "education" => ["tuition","books","school","library"],
+    "savings" => ["transfer to savings","save","investment"],
+];
+
+// Map textual category names to category_id by exact match (lowercase)
+$nameToId = [];
+foreach($categories as $c) $nameToId[strtolower($c['category_name'])] = $c['category_id'];
+
+// 1) Keyword matching
+foreach ($rules as $target => $keywords){
+    foreach ($keywords as $kw){
+        if (strpos($description, $kw) !== false){
+            // find best matching category_id for this target
+            // simple strategy: find first category whose name contains target
+            $foundId = null;
+            foreach ($nameToId as $name => $id){
+                if (strpos($name, $target) !== false) { $foundId = $id; break; }
+            }
+            // fallback: if none found, pick null
+            jsonResponse("success","Auto-categorized",["category_guess"=>$foundId, "category_label"=>$target]);
+        }
+    }
+}
+
+// 2) Fallback: choose user's most used category
+$stmt = $conn->prepare("SELECT category_id, COUNT(*) as cnt FROM expenses WHERE user_id = ? GROUP BY category_id ORDER BY cnt DESC LIMIT 1");
+$stmt->bind_param("i", $user_id);
+$stmt->execute();
+$res = $stmt->get_result();
+if ($res->num_rows > 0){
+    $row = $res->fetch_assoc();
+    jsonResponse("success","Fallback to most-used category",["category_guess"=>$row['category_id']]);
+}
+
+// 3) Final fallback: return NULL (uncategorized)
+jsonResponse("success","No category match",["category_guess"=>null]);

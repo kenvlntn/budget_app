@@ -1,0 +1,107 @@
+<?php
+// Add an expense, auto-categorize first (full pipeline)
+require_once "../config/db.php";
+require_once "../auth/check_session.php";
+
+if (!function_exists('getJsonInput')) {
+    function getJsonInput(){ return json_decode(file_get_contents('php://input'), true); }
+}
+if (!function_exists('jsonResponse')) {
+    function jsonResponse($status, $message, $data=null){
+        header('Content-Type: application/json');
+        echo json_encode(["status"=>$status,"message"=>$message,"data"=>$data]);
+        exit;
+    }
+}
+
+$input = getJsonInput();
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) jsonResponse("error","Unauthenticated");
+
+$amount = isset($input['amount']) ? (float)$input['amount'] : null;
+$description = $input['description'] ?? '';
+$expense_date = $input['date'] ?? date('Y-m-d');
+$manual_category_id = $input['category_id'] ?? null;
+$planned = isset($input['planned']) ? (int)$input['planned'] : 0;
+
+if ($amount === null) jsonResponse("error","Missing amount");
+
+// If user provided category_id, trust it. Else auto-categorize.
+$category_id = $manual_category_id;
+if (!$category_id) {
+    // call the internal auto-categorizer by including file logic (or via HTTP in real setup)
+    // We'll replicate a simple call: POST to auto_categorize logic locally
+    $payload = json_encode(["description"=>$description, "amount"=>$amount]);
+    // Instead of HTTP, include the logic directly (DRY would be better but we keep simple)
+    // Reuse the auto_categorize.php logic by including the file and capturing output is messy;
+    // We'll perform a simple inline categorization call (same rules as auto_categorize.php)
+    $desc = strtolower($description);
+    $mapping = [
+        "food" => ["milk tea","jollibee","mcdonald","burger","kfc","grocery","coffee","starbucks","panaderya","breakfast","lunch","dinner"],
+        "transportation" => ["gas","uber","grab","taxi","bus","jeep","parking","fuel"],
+        "entertainment" => ["netflix","spotify","cinema","movie","concert","game","playstation","xbox"],
+        "bills" => ["electric","water","meralco","internet","wifi","bill","globe","smart","tel"],
+        "shopping" => ["lazada","shopee","mall","clothes","shoes"],
+        "health" => ["clinic","hospital","doctor","pharmacy","medicine"],
+        "savings" => ["transfer to savings","save","investment"]
+    ];
+    // get categories list
+    $cat_q = $conn->query("SELECT category_id, category_name FROM categories");
+    $nameToId = [];
+    while($r = $cat_q->fetch_assoc()) $nameToId[strtolower($r['category_name'])] = $r['category_id'];
+
+    $found = null;
+    foreach ($mapping as $label => $keywords){
+        foreach ($keywords as $kw){
+            if (strpos($desc, $kw) !== false){
+                // find category id by label match
+                foreach ($nameToId as $name => $id){
+                    if (strpos($name, $label) !== false){ $found = $id; break 2; }
+                }
+            }
+        }
+    }
+    if ($found) $category_id = $found;
+    // fallback: user's most used category
+    if (!$category_id){
+        $stmt = $conn->prepare("SELECT category_id FROM expenses WHERE user_id = ? GROUP BY category_id ORDER BY COUNT(*) DESC LIMIT 1");
+        $stmt->bind_param("i", $user_id);
+        $stmt->execute();
+        $r = $stmt->get_result();
+        if ($r->num_rows) {
+            $row = $r->fetch_assoc();
+            $category_id = $row['category_id'];
+        }
+    }
+    // final fallback: NULL (uncategorized)
+}
+
+// Insert expense
+$sql = "INSERT INTO expenses (user_id, category_id, account_id, amount, description, expense_date, created_at)
+        VALUES (?, ?, NULL, ?, ?, ?, NOW())";
+$stmt = $conn->prepare($sql);
+$catParam = $category_id ?? null;
+if ($catParam === null) {
+    // bind as null - use "i" with 0 or handle separately
+    $stmt = $conn->prepare("INSERT INTO expenses (user_id, category_id, account_id, amount, description, expense_date, created_at) VALUES (?, NULL, NULL, ?, ?, ?, NOW())");
+    $stmt->bind_param("idss", $user_id, $amount, $description, $expense_date);
+} else {
+    $stmt->bind_param("ii d s s", $user_id, $catParam, $amount, $description, $expense_date);
+    // Note: Some PHP versions don't accept "ii d s s" spacing; safer to rebuild as:
+    $stmt = $conn->prepare("INSERT INTO expenses (user_id, category_id, account_id, amount, description, expense_date, created_at) VALUES (?, ?, NULL, ?, ?, ?, NOW())");
+    $stmt->bind_param("iisss", $user_id, $catParam, $amount, $description, $expense_date);
+}
+
+if ($stmt->execute()){
+    $expense_id = $stmt->insert_id;
+    // Optionally record an ai_insight if big expense
+    if ($amount > 10000) {
+        $tip = "Large expense detected: ₱".number_format($amount,2).". Consider reviewing this purchase.";
+        $ins = $conn->prepare("INSERT INTO ai_insights (user_id, insight_content, insight_type, generated_at) VALUES (?, ?, 'flag', NOW())");
+        $ins->bind_param("is", $user_id, $tip);
+        $ins->execute();
+    }
+    jsonResponse("success","Expense added",["expense_id"=>$expense_id,"category_id"=>$category_id]);
+} else {
+    jsonResponse("error","Insert failed: ".$stmt->error);
+}
