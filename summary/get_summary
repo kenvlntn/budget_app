@@ -1,0 +1,92 @@
+<?php
+// Compute totals, category breakdowns, needs vs wants, trends
+require_once "../config/db.php";
+require_once "../auth/check_session.php";
+
+if (!function_exists('jsonResponse')) {
+    function jsonResponse($status, $message, $data=null){
+        header('Content-Type: application/json');
+        echo json_encode(["status"=>$status,"message"=>$message,"data"=>$data]);
+        exit;
+    }
+}
+
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) jsonResponse("error","Unauthenticated");
+
+// Period / window: optional query params start_date, end_date
+$start = $_GET['start_date'] ?? date('Y-m-01'); // default start: first day of month
+$end = $_GET['end_date'] ?? date('Y-m-d');
+
+// 1) Total expenses
+$stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as total_exp FROM expenses WHERE user_id = ? AND expense_date BETWEEN ? AND ?");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$total_exp = $stmt->get_result()->fetch_assoc()['total_exp'] ?? 0.0;
+
+// 2) Total income
+$stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as total_inc FROM income WHERE user_id = ? AND income_date BETWEEN ? AND ?");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$total_inc = $stmt->get_result()->fetch_assoc()['total_inc'] ?? 0.0;
+
+// 3) Remaining balance
+$balance = $total_inc - $total_exp;
+
+// 4) Category totals
+$stmt = $conn->prepare("SELECT c.category_id, c.category_name, IFNULL(SUM(e.amount),0) as total FROM categories c LEFT JOIN expenses e ON c.category_id = e.category_id AND e.user_id = ? AND e.expense_date BETWEEN ? AND ? GROUP BY c.category_id, c.category_name ORDER BY total DESC");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$cat_res = $stmt->get_result();
+$category_totals = [];
+while ($r = $cat_res->fetch_assoc()) $category_totals[] = $r;
+
+// 5) Needs vs wants breakdown (requires categories table to have metadata necessity)
+$needs_total = 0; $wants_total = 0;
+$meta_q = $conn->query("SELECT category_id, necessity FROM categories");
+$necessity_map = [];
+while($m = $meta_q->fetch_assoc()) $necessity_map[$m['category_id']] = $m['necessity'] ?? 'n/a';
+
+$stmt = $conn->prepare("SELECT category_id, IFNULL(SUM(amount),0) as total FROM expenses WHERE user_id = ? AND expense_date BETWEEN ? AND ? GROUP BY category_id");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$res = $stmt->get_result();
+while($row = $res->fetch_assoc()){
+    $cid = $row['category_id'];
+    $t = (float)$row['total'];
+    $type = $necessity_map[$cid] ?? 'n/a';
+    if ($type === 'need') $needs_total += $t;
+    elseif ($type === 'want') $wants_total += $t;
+}
+
+// 6) Trend detection: compare with previous period of same length
+$period_days = (new DateTime($end))->diff(new DateTime($start))->days + 1;
+$prev_end = (new DateTime($start))->modify('-1 day')->format('Y-m-d');
+$prev_start = (new DateTime($prev_end))->modify("-".($period_days-1)." days")->format('Y-m-d');
+
+$stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as total_prev FROM expenses WHERE user_id = ? AND expense_date BETWEEN ? AND ?");
+$stmt->bind_param("iss", $user_id, $prev_start, $prev_end);
+$stmt->execute();
+$total_prev = $stmt->get_result()->fetch_assoc()['total_prev'] ?? 0.0;
+
+$trend = null;
+if ($total_prev > 0) {
+    $change_pct = (($total_exp - $total_prev) / $total_prev) * 100;
+    $trend = round($change_pct,2);
+} else {
+    $trend = $total_exp > 0 ? 100.0 : 0.0;
+}
+
+// Pack response
+$data = [
+    "total_expenses" => (float)$total_exp,
+    "total_income" => (float)$total_inc,
+    "balance" => (float)$balance,
+    "category_totals" => $category_totals,
+    "needs_total" => (float)$needs_total,
+    "wants_total" => (float)$wants_total,
+    "trend_percent_change" => $trend,
+    "period" => ["start"=>$start,"end"=>$end,"prev_start"=>$prev_start,"prev_end"=>$prev_end]
+];
+
+jsonResponse("success","Summary computed",$data);

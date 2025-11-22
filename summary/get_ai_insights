@@ -1,0 +1,168 @@
+<?php
+// Generate AI-like insights: overspending, tips, predicted overspend, financial score
+require_once "../config/db.php";
+require_once "../auth/check_session.php";
+
+if (!function_exists('jsonResponse')) {
+    function jsonResponse($status, $message, $data=null){
+        header('Content-Type: application/json');
+        echo json_encode(["status"=>$status,"message"=>$message,"data"=>$data]);
+        exit;
+    }
+}
+
+$user_id = $_SESSION['user_id'] ?? null;
+if (!$user_id) jsonResponse("error","Unauthenticated");
+
+// Accept optional date range
+$start = $_GET['start_date'] ?? date('Y-m-01');
+$end = $_GET['end_date'] ?? date('Y-m-d');
+
+// 1) Reuse summary calculations for totals and categories
+require_once __DIR__ . '/get_summary.php'; // Note: this will exit with JSON. Instead, replicate some queries here for clarity.
+
+// We'll manually compute needed metrics:
+$stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as total_exp FROM expenses WHERE user_id = ? AND expense_date BETWEEN ? AND ?");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$total_exp = (float)$stmt->get_result()->fetch_assoc()['total_exp'];
+
+$stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as total_inc FROM income WHERE user_id = ? AND income_date BETWEEN ? AND ?");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$total_inc = (float)$stmt->get_result()->fetch_assoc()['total_inc'];
+
+// category breakdown
+$stmt = $conn->prepare("SELECT c.category_id, c.category_name, IFNULL(SUM(e.amount),0) as total FROM categories c LEFT JOIN expenses e ON c.category_id = e.category_id AND e.user_id = ? AND e.expense_date BETWEEN ? AND ? GROUP BY c.category_id, c.category_name ORDER BY total DESC");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$res = $stmt->get_result();
+$category_totals = [];
+while($r = $res->fetch_assoc()) $category_totals[] = $r;
+
+// 2) Overspending detection: compare category pct vs threshold
+$insights = [];
+$total_exp_nonzero = $total_exp > 0 ? $total_exp : 1;
+foreach ($category_totals as $c){
+    $pct = ($c['total'] / $total_exp_nonzero) * 100;
+    if ($pct > 40) {
+        $insights[] = [
+            "type"=>"overspend",
+            "text"=>"You spent ".round($pct,1)."% on {$c['category_name']} — this is high. Consider reducing by 10-20%."
+        ];
+    }
+}
+
+// 3) Predictive overspend: detect fastest increasing category over last 2 periods
+// compute totals for this period and previous equal-length period
+$period_days = (new DateTime($end))->diff(new DateTime($start))->days + 1;
+$prev_end = (new DateTime($start))->modify('-1 day')->format('Y-m-d');
+$prev_start = (new DateTime($prev_end))->modify("-".($period_days-1)." days")->format('Y-m-d');
+
+$predictions = [];
+foreach ($category_totals as $c){
+    $cid = (int)$c['category_id'];
+    $stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as t FROM expenses WHERE user_id = ? AND category_id = ? AND expense_date BETWEEN ? AND ?");
+    $stmt->bind_param("iiss", $user_id, $cid, $start, $end);
+    $stmt->execute();
+    $cur = (float)$stmt->get_result()->fetch_assoc()['t'];
+
+    $stmt = $conn->prepare("SELECT IFNULL(SUM(amount),0) as t FROM expenses WHERE user_id = ? AND category_id = ? AND expense_date BETWEEN ? AND ?");
+    $stmt->bind_param("iiss", $user_id, $cid, $prev_start, $prev_end);
+    $stmt->execute();
+    $prev = (float)$stmt->get_result()->fetch_assoc()['t'];
+
+    $growth = $prev > 0 ? (($cur - $prev) / $prev) * 100 : ($cur > 0 ? 100 : 0);
+    $predictions[] = ["category_id"=>$cid,"category_name"=>$c['category_name'],"growth_pct"=>round($growth,2),"current"=>$cur,"previous"=>$prev];
+}
+
+// find highest growth
+usort($predictions, function($a,$b){ return $b['growth_pct'] <=> $a['growth_pct']; });
+if (!empty($predictions) && $predictions[0]['growth_pct'] > 10) {
+    $top = $predictions[0];
+    $insights[] = [
+        "type"=>"prediction",
+        "text"=>"Based on recent trends, you're likely to overspend on {$top['category_name']} (growth: {$top['growth_pct']}%)."
+    ];
+}
+
+// 4) Smart budget recommendation: suggest savings target = 15% of income or fallback
+$savings_target = null;
+if ($total_inc > 0) {
+    $savings_target = round($total_inc * 0.15, 2);
+    $insights[] = [
+        "type"=>"recommendation",
+        "text"=>"Suggested savings target for this period: ₱".number_format($savings_target,2)." (15% of income)."
+    ];
+} else {
+    $insights[] = ["type"=>"recommendation","text"=>"No income recorded this period — cannot calculate savings target."];
+}
+
+// 5) Financial tips (randomized bank of tips)
+$tips_bank = [
+    "Bring lunch twice a week instead of eating out.",
+    "Cancel an unused subscription and save that amount.",
+    "Use public transport 2x/week to reduce transport costs.",
+    "Set automatic transfers to savings on payday.",
+    "Compare prices before buying non-essential items."
+];
+$tip = $tips_bank[array_rand($tips_bank)];
+$insights[] = ["type"=>"tip","text"=>$tip];
+
+// 6) Financial score (0-100): simple composite
+// components: savings_rate (30%), spending_variation (30%), consistency (40%)
+// savings_rate score
+$savings_rate = ($total_inc>0) ? ($savings_target / $total_inc) : 0;
+$savings_score = min(1, $savings_rate) * 100; // 0-100 mapped
+
+// spending_variation: lower variation => better. We'll use ratio of needs/wants
+$needs = 0; $wants=0;
+$meta_q = $conn->query("SELECT category_id, necessity FROM categories");
+$nec = [];
+while($m = $meta_q->fetch_assoc()) $nec[$m['category_id']] = $m['necessity'] ?? 'n/a';
+
+$stmt = $conn->prepare("SELECT category_id, IFNULL(SUM(amount),0) as total FROM expenses WHERE user_id = ? AND expense_date BETWEEN ? AND ? GROUP BY category_id");
+$stmt->bind_param("iss", $user_id, $start, $end);
+$stmt->execute();
+$res = $stmt->get_result();
+while($r = $res->fetch_assoc()){
+    if (($nec[$r['category_id']] ?? '') === 'need') $needs += $r['total'];
+    else $wants += $r['total'];
+}
+$needs_ratio = ($needs+$wants) > 0 ? $needs / ($needs + $wants) : 0.5;
+$spending_score = min(1, $needs_ratio + 0.1) * 100; // reward higher needs ratio modestly
+
+// consistency: check if user has income entries in last 3 periods
+// Simplified: count months with income in last 3 months
+$months_with_income = 0;
+for ($i=0;$i<3;$i++){
+    $mstart = (new DateTime())->modify("-{$i} months")->format('Y-m-01');
+    $mend = (new DateTime($mstart))->format('Y-m-t');
+    $stmt = $conn->prepare("SELECT COUNT(*) as cnt FROM income WHERE user_id = ? AND income_date BETWEEN ? AND ?");
+    $stmt->bind_param("iss", $user_id, $mstart, $mend);
+    $stmt->execute();
+    $cnt = (int)$stmt->get_result()->fetch_assoc()['cnt'];
+    if ($cnt>0) $months_with_income++;
+}
+$consistency_score = ($months_with_income/3) * 100;
+
+// weights: savings 30%, variation 30%, consistency 40%
+$financial_score = round($savings_score*0.3 + $spending_score*0.3 + $consistency_score*0.4, 2);
+
+// 7) Insert top insights into ai_insights table (optional: store only top 2)
+$to_store = array_slice($insights,0,3);
+foreach ($to_store as $it){
+    $txt = $it['text'];
+    $type = $it['type'] ?? 'general';
+    $stmt = $conn->prepare("INSERT INTO ai_insights (user_id, insight_content, insight_type, generated_at) VALUES (?, ?, ?, NOW())");
+    $stmt->bind_param("iss", $user_id, $txt, $type);
+    $stmt->execute();
+}
+
+$response = [
+    "insights" => $insights,
+    "financial_score" => $financial_score,
+    "savings_target" => $savings_target
+];
+
+jsonResponse("success","AI insights generated",$response);
